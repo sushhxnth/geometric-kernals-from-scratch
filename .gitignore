@@ -1,0 +1,6 @@
+tests/__pycache__/test_rigor.cpython-313-pytest-9.1.1.pyc
+README.md
+src/__pycache__/__init__.cpython-313.pyc
+src/__pycache__/operators.cpython-313.pyc
+src/__pycache__/kernels.cpython-313.pyc
+experiments/__pycache__/run_benchmarks.cpython-313.pyc
