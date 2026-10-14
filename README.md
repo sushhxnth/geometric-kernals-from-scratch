@@ -1,89 +1,118 @@
-# Finite-Sample Variance, Spectral Oversmoothing, and Size-Induced Distribution Shift: Benchmarking Explicit Message-Passing Operators Against Entropic Optimal Transport & Graph Kernels
+# finite-sample variance, spectral oversmoothing, and size-induced distribution shift
 
-**Status:** Active Independent Research (June 2026 – Present)  
-**Research Area:** Statistical Learning Theory, Optimal Transport, and Geometric Deep Learning  
-**Methodology:** Mathematics first, explicit from-scratch implementation second, controlled synthetic experimentation third, and rigorous failure-mode interpretation throughout.
+Message-passing layers (GCN, GIN, GraphSAGE) and an optimal-transport graph kernel, written by hand in PyTorch, NumPy and SciPy and compared on synthetic stochastic block model graphs. There is no torch_geometric or DGL anywhere in the code.
 
----
+I started this because two questions kept coming up while reading GNN benchmark papers. In the small-data regime, how does a trained message-passing network compare with a closed-form kernel method, in error and in seed-to-seed spread? And how much of the reported error survives if train and test graphs differ in size instead of being split at random? The data are synthetic on purpose: the target function is known, and nothing about the split is accidental.
 
-## Abstract
+Work in progress, started June 2026. All results are from five seeds, and I say below where that is not enough.
 
-Standard evaluations of Graph Neural Networks (GNNs) rely heavily on high-level library abstractions (`torch_geometric`, `dgl`) and random train/test splits on static benchmark datasets. While convenient, this paradigm obscures two critical failure modes in scientific machine learning: **(1) finite-sample optimization variance** relative to closed-form non-parametric kernel estimators, and **(2) severe out-of-distribution (OOD) degradation under topological size shift** caused by structural data leakage in random splits.
+## Setup
 
-This repository presents an end-to-end mathematical and empirical investigation comparing explicit message-passing neural architectures (`GCN`, `GraphSAGE`, `GIN`) against continuous Weisfeiler-Lehman (WL) diffusion embeddings paired with Entropic Optimal Transport (Sinkhorn-Wasserstein) Kernel Ridge Regression (KRR). All neural operators, analytical backward passes, and Sinkhorn-Knopp solvers are implemented from scratch in pure PyTorch, NumPy, and SciPy without external graph learning libraries. Every message-passing layer is verified via centered `float64` finite-difference gradient checks (relative error $< 10^{-6}$) and strict permutation equivariance assertions ($< 10^{-12}$ error). Controlled experiments on tunable Stochastic Block Models (SBMs) demonstrate that while a 2-layer `ExplicitGIN` achieves lower asymptotic bias when its message-passing depth aligns with the data-generating motif (`0.1943` vs. `0.2126` RMSE at $N = 60$), closed-form Sinkhorn-WL KRR reduces seed-to-seed variance by **50.3%** (`±0.0133` vs. `±0.0264`). Furthermore, replacing standard random splits with strict size-grouped OOD splits ($N_{\text{nodes}} \in [10, 24] \rightarrow [25, 32]$) exposes a **74.3% test error degradation** in message passing (`0.1746` $\rightarrow$ `0.3043` RMSE) alongside an unnormalized density scaling failure in uniform-marginal Optimal Transport (`0.3611` RMSE).
+Python 3.13 (the runs here used 3.13.3 on Windows).
 
----
+```bash
+pip install -r requirements.txt
+python -m pytest -v                    # gradient and equivariance checks
+python -m experiments.run_benchmarks   # reruns the experiments, rewrites figures/results_oct2026.png
+```
 
-## 1. Mathematical Formulation & Operator Architecture
+## What is implemented
 
-Let $G = (V, E)$ be an undirected graph with $\vert{}V\vert{} = n$ nodes, adjacency matrix $A \in \{0, 1\}^{n \times n}$, degree matrix $D = \text{diag}(A \mathbf{1}_n)$, and node covariate matrix $X \in \mathbb{R}^{n \times d}$.
+Notation: a graph has $n$ nodes, adjacency $A$, degree matrix $D$ and features $X \in \mathbb{R}^{n \times d}$. I write $\tilde S = \tilde D^{-1/2}(A+I)\tilde D^{-1/2}$.
 
-### 1.1 Explicit Message-Passing Operators & Analytical Jacobians (`src/operators.py`)
+### Layers (`src/operators.py`)
 
-Rather than relying on black-box automatic differentiation through sparse gather-scatter primitives, the linear message-passing operator is formulated explicitly via the symmetric normalized shift operator $\tilde{S} = \tilde{D}^{-1/2}(A + I_n)\tilde{D}^{-1/2}$:
+GCN: $Y = \tilde S X W + \mathbf 1 b^\top$. The backward pass is written out by hand in a `torch.autograd.Function` instead of being left to autograd. For an upstream gradient $G = \partial \mathcal L / \partial Y$:
 
-$$Y = \tilde{S} X W + \mathbf{1}_n b^\top, \quad W \in \mathbb{R}^{d_{\text{in}} \times d_{\text{out}}}, \; b \in \mathbb{R}^{d_{\text{out}}}$$
+$$\frac{\partial \mathcal L}{\partial X} = (\tilde S^\top G) W^\top, \quad \frac{\partial \mathcal L}{\partial W} = X^\top \tilde S^\top G, \quad \frac{\partial \mathcal L}{\partial b} = G^\top \mathbf 1, \quad \frac{\partial \mathcal L}{\partial \tilde S} = G (XW)^\top$$
 
-In `ExplicitMessagePassingFn(torch.autograd.Function)`, the exact analytical backward pass is derived in closed matrix form for an upstream cotangent tensor $G = \frac{\partial \mathcal{L}}{\partial Y} \in \mathbb{R}^{n \times d_{\text{out}}}$:
+GIN: $H' = \mathrm{MLP}\big(((1+\epsilon) I + A) H\big)$ with learnable $\epsilon$.
 
-$$\frac{\partial \mathcal{L}}{\partial \tilde{S}} = G (XW)^\top, \quad \frac{\partial \mathcal{L}}{\partial X} = \left(\tilde{S}^\top G\right) W^\top, \quad \frac{\partial \mathcal{L}}{\partial W} = X^\top \left(\tilde{S}^\top G\right), \quad \frac{\partial \mathcal{L}}{\partial b} = G^\top \mathbf{1}_n$$
+GraphSAGE (mean aggregator): $H' = H W_{\text{self}} + (D^{-1} A H) W_{\text{neigh}}$.
 
-Three distinct structural aggregation paradigms are implemented from first principles:
-* **`ExplicitGCNLayer`:** Spectral low-pass filtering via $\tilde{S} X W$ with explicit analytical backward propagation.
-* **`ExplicitGINLayer`:** Injective multiset aggregation parameterized by learnable $\epsilon \in \mathbb{R}$:
-  $$H^{(k)} = \text{MLP}_\theta\Big(\big((1 + \epsilon)I_n + A\big) H^{(k-1)}\Big)$$
-* **`ExplicitGraphSAGE`:** Decoupled ego-feature and random-walk neighborhood aggregation:
-  $$H^{(k)} = X W_{\text{self}} + \left(D^{-1} A X\right) W_{\text{neigh}}$$
+### Kernel (`src/kernels.py`)
 
-### 1.2 Continuous Weisfeiler-Lehman Diffusion & Entropic Optimal Transport (`src/kernels.py`)
+Each graph is turned into node embeddings by stacking diffusion steps, in the spirit of Weisfeiler-Lehman refinement:
 
-To construct a non-parametric baseline sensitive to both topological structure and continuous node covariates, each graph $G_i$ is mapped to a $K$-step structural diffusion distribution:
+$$\Phi_K = [\, X \;\|\; \tilde S X \;\|\; \dots \;\|\; \tilde S^K X \,] \in \mathbb{R}^{n \times (K+1)d}.$$
 
-$$\Phi_K(X, A) = \left[ X \,\big\Vert{}\, \tilde{S} X \,\big\Vert{}\, \tilde{S}^2 X \,\big\Vert{}\, \dots \,\big\Vert{}\, \tilde{S}^K X \right] \in \mathbb{R}^{n \times (K+1)d}$$
+The rows of $\Phi_K$ are treated as a uniform empirical measure. For two graphs, the ground cost is $C_{pq} = \|\Phi_K(G_A)_p - \Phi_K(G_B)_q\|^2$ and the entropic transport problem is
 
-Given two graphs $G_A = (X_A, A_A)$ with $n$ nodes and $G_B = (X_B, A_B)$ with $m$ nodes, we treat their node embeddings as empirical measures $\mu = \frac{1}{n}\sum_{p=1}^n \delta_{\Phi_K(G_A)_p}$ and $\nu = \frac{1}{m}\sum_{q=1}^m \delta_{\Phi_K(G_B)_q}$. The ground cost matrix is $C_{pq} = \Vert{}\Phi_K(G_A)_p - \Phi_K(G_B)_q\Vert{}_2^2$. The entropic-regularized Wasserstein distance $\mathcal{W}_\varepsilon(G_A, G_B)$ is computed by solving the strictly convex optimal transport problem:
+$$\mathcal W_\varepsilon = \min_{\Pi \in U(\mu,\nu)} \langle \Pi, C\rangle + \varepsilon \sum_{pq} \Pi_{pq}(\log \Pi_{pq} - 1),$$
 
-$$\mathcal{W}_\varepsilon(\mu, \nu) = \min_{\Pi \in U(\mu, \nu)} \langle \Pi, C \rangle_F + \varepsilon \sum_{p=1}^n \sum_{q=1}^m \Pi_{pq} (\log \Pi_{pq} - 1)$$
+solved with Sinkhorn-Knopp scaling ($u \leftarrow \mu / Kv$, $v \leftarrow \nu / K^\top u$, $K = e^{-C/\varepsilon}$, stabilised as in the code). I use the plain entropic cost, not the debiased Sinkhorn divergence, so $\mathcal W_\varepsilon(G,G) \neq 0$ in general. The Gram matrix is $\mathcal K_{ij} = \exp(-\gamma\, \mathcal W_\varepsilon(G_i, G_j))$ and kernel ridge regression is solved in closed form:
 
-where $U(\mu, \nu) = \{\Pi \in \mathbb{R}_{+}^{n \times m} \mid \Pi \mathbf{1}_m = \mu, \, \Pi^\top \mathbf{1}_n = \nu\}$. Using Sinkhorn-Knopp matrix scaling on the stabilized Gibbs kernel $K = \exp(-\tilde{C}/\varepsilon)$:
+$$\hat\alpha = (\mathcal K_{\text{train}} + \lambda I)^{-1} y_{\text{train}}, \qquad \hat y_{\text{test}} = \mathcal K_{\text{test,train}} \hat\alpha .$$
 
-$$u^{(t+1)} = \frac{\mu}{K v^{(t)}}, \quad v^{(t+1)} = \frac{\nu}{K^\top u^{(t+1)}}, \quad \Pi^* = \text{diag}(u^*) K \text{diag}(v^*)$$
+### Dirichlet energy
 
-The resulting pairwise transport distances define an exponential Wasserstein Gram matrix $\mathcal{K}_{ij} = \exp(-\gamma \mathcal{W}_\varepsilon(G_i, G_j))$, which is solved in closed form via regularized Kernel Ridge Regression:
+To watch oversmoothing I track $\mathcal E(H) = \frac1n \mathrm{tr}(H^\top L H)$ with $L = I - D^{-1/2} A D^{-1/2}$. Written over edges this is $\frac{1}{2n}\sum_{u,v} A_{uv}\, \| H_u/\sqrt{d_u} - H_v/\sqrt{d_v} \|^2$, with the sum over ordered pairs.
 
-$$\hat{\alpha} = (\mathcal{K}_{\text{train}} + \lambda I_N)^{-1} y_{\text{train}}, \quad \hat{y}_{\text{test}} = \mathcal{K}_{\text{test, train}} \hat{\alpha}$$
+## Checks
 
-### 1.3 Spectral Oversmoothing & Dirichlet Energy Functional
+Every layer goes through two checks in float64:
 
-To quantify high-frequency signal attenuation across deep message-passing cascades independent of finite-sample overfitting, we track the normalized Dirichlet energy functional over the symmetric normalized graph Laplacian $L = I_n - D^{-1/2} A D^{-1/2}$:
+1. Central finite differences with step $10^{-6}$ against the analytical gradient, relative error below $10^{-6}$.
+2. Node-permutation equivariance, $f(PX, PAP^\top) = P f(X, A)$, to about $10^{-12}$. The Dirichlet energy is checked to be invariant under relabelling.
 
-$$\mathcal{E}\big(H^{(l)}\big) = \frac{1}{n} \text{Tr}\!\left(H^{(l)\top} L H^{(l)}\right) = \frac{1}{2n} \sum_{(u,v) \in E} \left\Vert{} \frac{H_u^{(l)}}{\sqrt{d_u}} - \frac{H_v^{(l)}}{\sqrt{d_v}} \right\Vert{}_2^2$$
+Seven tests in `tests/test_rigor.py`, all passing (1.27 s on my machine).
 
----
+## Data
 
-## 2. Numerical Verification & Invariance Suite (`tests/test_rigor.py`)
+Two-block SBM with homophily $\rho \in [0,1]$ and $n \sim \mathcal U(n_{\min}, n_{\max})$. Edge probabilities are $p_{\text{in}} = 0.45\rho + 0.10$ and $p_{\text{out}} = 0.45(1-\rho) + 0.05$. Node features in $\mathbb{R}^4$ have block-dependent means $(2c_i - 1)\,[1.0, -0.8, 0.5, 0.3]^\top$ plus $\mathcal N(0, 0.4^2 I)$ noise. The regression target is
 
-Before running empirical benchmarks, every operator in `src/operators.py` is subjected to two strict numerical verification protocols in double precision (`torch.float64`):
+$$y(G) = \frac1n \sum_i \Big( \sin\big((\tilde D^{-1}AX)_{i,0}\big) + \tfrac12 (\tilde D^{-1}AX)_{i,1}^2 \Big) + 0.8\,\frac{\mathbf 1^\top A \mathbf 1}{n^{1.5}} + \epsilon, \qquad \epsilon \sim \mathcal N(0, \sigma^2).$$
 
-1. **Centered Finite-Difference Jacobian Verification:**  
-   For every parameter and input tensor $\theta$, analytical gradients $\nabla_\theta \mathcal{L}$ are tested against numerical finite differences with step size $\delta = 10^{-6}$:
-   $$\frac{\left\Vert{} \nabla_\theta^{\text{analytical}} \mathcal{L} - \frac{\mathcal{L}(\theta + \delta e_i) - \mathcal{L}(\theta - \delta e_i)}{2\delta} \right\Vert{}_2}{\max\left(\left\Vert{}\nabla_\theta^{\text{analytical}} \mathcal{L}\right\Vert{}_2, \left\Vert{}\nabla_\theta^{\text{numerical}} \mathcal{L}\right\Vert{}_2\right)} < 10^{-6}$$
-2. **Strict Node-Permutation Equivariance & Invariance:**  
-   For a randomly sampled permutation matrix $P \in \Pi_n$, every message-passing layer is verified to commute with node relabeling up to machine epsilon ($\approx 10^{-12}$), while the Dirichlet energy functional is verified to be strictly permutation-invariant:
-   $$f(PX, PAP^\top) = P f(X, A), \quad \mathcal{E}(PX, PAP^\top) = \mathcal{E}(X, A)$$
+The first part depends on neighbourhood-averaged features. The second is a global size term; at fixed edge density it grows roughly like $\sqrt n$.
 
-```text
-$ python -m pytest -v
-============================= test session starts =============================
-platform win32 -- Python 3.13.3, pytest-9.1.1, pluggy-1.6.0
-collected 7 items
+## Experiments
 
-tests/test_rigor.py::test_node_permutation_equivariance[ExplicitGCNLayer] PASSED
-tests/test_rigor.py::test_node_permutation_equivariance[ExplicitGINLayer] PASSED
-tests/test_rigor.py::test_node_permutation_equivariance[ExplicitGraphSAGE] PASSED
-tests/test_rigor.py::test_float64_finite_difference_gradcheck[ExplicitGCNLayer] PASSED
-tests/test_rigor.py::test_float64_finite_difference_gradcheck[ExplicitGINLayer] PASSED
-tests/test_rigor.py::test_float64_finite_difference_gradcheck[ExplicitGraphSAGE] PASSED
-tests/test_rigor.py::test_dirichlet_energy_permutation_invariance PASSED
+### 1. Small-sample comparison
 
-============================== 7 passed in 1.27s ==============================
+Test set: 50 graphs, $n \in [12, 24]$, $\rho = 0.75$, $\sigma = 0.15$. KRR hyperparameters ($\gamma \in \{0.1, 0.3, 0.6\}$, $\lambda \in \{10^{-2}, 10^{-1}, 0.5\}$) are picked on an internal 80/20 split. The GIN has two layers, hidden size 24, AdamW with weight decay $10^{-3}$, and sees the same training graphs. Test RMSE, mean ± std over five seeds:
+
+| N train | Sinkhorn-WL KRR | 2-layer GIN | std ratio (GIN / KRR) |
+|---|---|---|---|
+| 30 | 0.2356 ± 0.0217 | 0.2058 ± 0.0268 | 1.24 |
+| 60 | 0.2126 ± 0.0133 | 0.1943 ± 0.0264 | 1.98 |
+| 120 | 0.2502 ± 0.0461 | 0.1725 ± 0.0244 | 0.53 |
+| 240 | 0.2346 ± 0.0290 | 0.1888 ± 0.0170 | 0.59 |
+
+The GIN has the lower mean error at every size. At $N = 60$ the seed-to-seed standard deviation of the GIN is about twice that of the KRR, but I would not read much into it. With five seeds an F-test on that ratio gives $p \approx 0.2$, and at $N = 120$ the ratio goes the other way. Also, the KRR error is not monotone in $N$ (0.2126 at 60, 0.2502 at 120). My guess is a mix of hyperparameter selection on one small validation split and a Gram matrix that is not guaranteed to be positive semidefinite (see below), but I have not checked either.
+
+### 2. Random split versus size-grouped split
+
+180 graphs with $n \in [10, 32]$, 130 for training and 50 for testing. Random split: train and test both drawn from $[10, 32]$. Grouped split: train on $n \in [10, 24]$, test on $n \in [25, 32]$.
+
+| split | 2-layer GIN | Sinkhorn-WL KRR |
+|---|---|---|
+| random | 0.1746 | 0.2180 |
+| grouped | 0.3043 (+74.3%) | 0.3611 (+65.6%) |
+
+For the GIN I report 0.3043 as the generalisation figure; the random-split number is optimistic.
+
+Both models degrade, and I have two untested explanations that are different for each. For the GIN, sum aggregation makes pre-activations scale with degree, and degree grows with $n$, so larger test graphs may push the MLP outside the range it saw in training. For the kernel, a uniform empirical measure does not encode $n$: duplicate every node $k$ times and the measure is unchanged, so the transport cost cannot see graph size, while the target has a size term. A clean test would be to remove the size term from the target and see whether the kernel's degradation disappears. I have not run that.
+
+One more caveat on this table. Because the size term grows with $n$, the target's own scale is different on the larger test graphs, so RMSE is not directly comparable across the two splits. A mean-predictor baseline on the grouped test set is needed and is not here yet.
+
+### 3. Oversmoothing
+
+Without any correction, the Dirichlet energy of the hidden states decays roughly exponentially over depths 1 to 10 (figure, panel B). An initial-residual connection,
+
+$$H^{(l)} = (1-\alpha)\,\sigma(\tilde S H^{(l-1)} W) + \alpha H^{(0)}, \qquad \alpha = 0.18,$$
+
+keeps the energy away from zero over the same ten layers. This is the idea from GCNII, applied here without the identity-mapping part. The figure uses $\alpha = 0.18$ only.
+
+![results](figures/results_oct2026.png)
+
+## Known issues
+
+- Five seeds per setting, no confidence intervals beyond the one F-test above.
+- $\exp(-\gamma \mathcal W_\varepsilon)$ is not guaranteed to be a positive semidefinite kernel. I add $\lambda I$ but do not project or correct the Gram matrix.
+- KRR hyperparameters come from a single 80/20 split.
+- Synthetic data only. The target was written by me, so "GIN does better at small $n$" is partly a statement about my target, and I have not tested why.
+- No mean-predictor or constant baseline in the grouped-split experiment, and no ablation of the size term.
+
+## In progress
+
+Replacing the uniform marginals with degree-weighted unbalanced OT so the kernel can see graph size, and the size-term ablation above.
